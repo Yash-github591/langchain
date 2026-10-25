@@ -1805,18 +1805,41 @@ class BaseChatModel(BaseLanguageModel[AIMessage], ABC):
         input_messages = [
             _normalize_messages(message_list) for message_list in messages
         ]
-        results = await asyncio.gather(
-            *[
+        generation_tasks = [
+            asyncio.create_task(
                 self._agenerate_with_cache(
                     m,
                     stop=stop,
                     run_manager=run_managers[i] if run_managers else None,
                     **kwargs,
                 )
-                for i, m in enumerate(input_messages)
-            ],
-            return_exceptions=True,
-        )
+            )
+            for i, m in enumerate(input_messages)
+        ]
+
+        try:
+            results = await asyncio.gather(
+                *generation_tasks,
+                return_exceptions=True,
+            )
+        except asyncio.CancelledError as cancellation:
+            cleanup_task = asyncio.create_task(
+                self._finalize_cancelled_generation_tasks(
+                    generation_tasks,
+                    run_managers,
+                    cancellation,
+                )
+            )
+
+            while not cleanup_task.done():
+                try:
+                    await asyncio.shield(cleanup_task)
+                except asyncio.CancelledError:
+                    continue
+
+            cleanup_task.result()
+            raise
+
         exceptions = []
         for i, res in enumerate(results):
             if isinstance(res, BaseException):
@@ -1829,6 +1852,7 @@ class BaseChatModel(BaseLanguageModel[AIMessage], ABC):
                         ),
                     )
                 exceptions.append(res)
+
         if exceptions:
             if run_managers:
                 await asyncio.gather(
@@ -1844,13 +1868,23 @@ class BaseChatModel(BaseLanguageModel[AIMessage], ABC):
                     ]
                 )
             raise exceptions[0]
+
         flattened_outputs = [
-            LLMResult(generations=[res.generations], llm_output=res.llm_output)  # type: ignore[union-attr]
+            LLMResult(
+                generations=[res.generations],  # type: ignore[union-attr]
+                llm_output=res.llm_output,  # type: ignore[union-attr]
+            )
             for res in results
         ]
-        llm_output = self._combine_llm_outputs([res.llm_output for res in results])  # type: ignore[union-attr]
-        generations = [res.generations for res in results]  # type: ignore[union-attr]
+        llm_output = self._combine_llm_outputs(
+            [res.llm_output for res in results]  # type: ignore[union-attr]
+        )
+        generations = [
+            res.generations
+            for res in results  # type: ignore[union-attr]
+        ]
         output = LLMResult(generations=generations, llm_output=llm_output)
+
         await asyncio.gather(
             *[
                 run_manager.on_llm_end(flattened_output)
@@ -1859,11 +1893,56 @@ class BaseChatModel(BaseLanguageModel[AIMessage], ABC):
                 )
             ]
         )
+
         if run_managers:
             output.run = [
                 RunInfo(run_id=run_manager.run_id) for run_manager in run_managers
             ]
+
         return output
+
+    async def _finalize_cancelled_generation_tasks(
+        self,
+        generation_tasks: list[asyncio.Task[ChatResult]],
+        run_managers: list[AsyncCallbackManagerForLLMRun] | None,
+        cancellation: asyncio.CancelledError,
+    ) -> None:
+        """Dispatch terminal callbacks after waiting for cancelled generation tasks."""
+        results = await asyncio.gather(
+            *generation_tasks,
+            return_exceptions=True,
+        )
+        if not run_managers:
+            return
+
+        terminal_callbacks = []
+        for run_manager, result in zip(run_managers, results, strict=False):
+            if isinstance(result, BaseException):
+                error = (
+                    cancellation
+                    if isinstance(result, asyncio.CancelledError)
+                    else result
+                )
+                generations_with_error_metadata = _generate_response_from_error(error)
+                terminal_callbacks.append(
+                    run_manager.on_llm_error(
+                        error,
+                        response=LLMResult(
+                            generations=[generations_with_error_metadata]
+                        ),
+                    )
+                )
+            else:
+                terminal_callbacks.append(
+                    run_manager.on_llm_end(
+                        LLMResult(
+                            generations=[result.generations],
+                            llm_output=result.llm_output,
+                        )
+                    )
+                )
+
+        await asyncio.gather(*terminal_callbacks)
 
     @override
     def generate_prompt(

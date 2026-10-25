@@ -1,16 +1,18 @@
 """Test base chat model."""
 
+import asyncio
 import uuid
 import warnings
 from collections.abc import AsyncIterator, Iterator
 from contextlib import contextmanager
 from importlib.metadata import PackageNotFoundError
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Literal, get_type_hints
 from unittest.mock import patch
 
 import pytest
 from langsmith.env import get_langchain_env_var_metadata
-from pydantic import Field, model_validator
+from pydantic import Field, PrivateAttr, model_validator
 from typing_extensions import Self, override
 
 from langchain_core._api import LangChainDeprecationWarning
@@ -23,6 +25,7 @@ from langchain_core.language_models import (
     BaseChatModel,
     FakeListChatModel,
     ParrotFakeChatModel,
+    chat_models,
 )
 from langchain_core.language_models._utils import (
     _filter_invocation_params_for_tracing,
@@ -1132,6 +1135,301 @@ class _AnotherFakeChatModel(BaseChatModel):
     ) -> AsyncIterator[ChatGenerationChunk]:
         for chunk in self.chunks:
             yield ChatGenerationChunk(message=chunk)
+
+
+class _CancellableChatModel(BaseChatModel):
+    fail: bool = False
+    expected_slow_calls: int = 1
+
+    _entered: asyncio.Event = PrivateAttr(default_factory=asyncio.Event)
+    _release: asyncio.Event = PrivateAttr(default_factory=asyncio.Event)
+    _started_slow_calls: int = PrivateAttr(default=0)
+    _all_slow_entered: asyncio.Event = PrivateAttr(default_factory=asyncio.Event)
+
+    @property
+    def _llm_type(self) -> str:
+        return "cancellable-chat-model"
+
+    def _generate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: CallbackManagerForLLMRun | None = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        del messages, stop, run_manager, kwargs
+        msg = "This test uses async generation only"
+        raise AssertionError(msg)
+
+    async def _agenerate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: AsyncCallbackManagerForLLMRun | None = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        del stop, run_manager, kwargs
+
+        if messages[0].content == "fast":
+            return ChatResult(
+                generations=[ChatGeneration(message=AIMessage(content="synthetic"))]
+            )
+
+        self._started_slow_calls += 1
+        self._entered.set()
+
+        if self._started_slow_calls >= self.expected_slow_calls:
+            self._all_slow_entered.set()
+
+        await self._release.wait()
+
+        if self.fail:
+            msg = "synthetic failure"
+            raise RuntimeError(msg)
+
+        return ChatResult(
+            generations=[ChatGeneration(message=AIMessage(content="synthetic"))]
+        )
+
+
+class _CancellationRecordingHandler(BaseCallbackHandler):
+    def __init__(self) -> None:
+        self.events: list[str] = []
+
+    def on_chat_model_start(self, *args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        self.events.append("start")
+
+    def on_llm_end(self, *args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        self.events.append("end")
+
+    def on_llm_error(self, *args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        self.events.append("error")
+
+
+@pytest.mark.parametrize("outcome", ["success", "error", "cancel"])
+@pytest.mark.asyncio
+async def test_ainvoke_terminal_callback(outcome: str) -> None:
+    model = _CancellableChatModel(fail=outcome == "error")
+    recorder = _CancellationRecordingHandler()
+    task = asyncio.create_task(
+        model.ainvoke("synthetic", config={"callbacks": [recorder]})
+    )
+
+    try:
+        await asyncio.wait_for(model._entered.wait(), 5)
+        if outcome == "cancel":
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 5)
+        else:
+            model._release.set()
+            if outcome == "error":
+                with pytest.raises(RuntimeError, match="synthetic failure"):
+                    await asyncio.wait_for(task, 5)
+            else:
+                assert (await asyncio.wait_for(task, 5)).content == "synthetic"
+    finally:
+        model._release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    assert recorder.events == [
+        "start",
+        "end" if outcome == "success" else "error",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_agenerate_cancellation_finalizes_completed_batch_items() -> None:
+    model = _CancellableChatModel()
+    recorder = _CancellationRecordingHandler()
+    task = asyncio.create_task(
+        model.agenerate(
+            [[HumanMessage(content="fast")], [HumanMessage(content="slow")]],
+            callbacks=[recorder],
+        )
+    )
+
+    try:
+        await asyncio.wait_for(model._entered.wait(), 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 5)
+    finally:
+        model._release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    assert recorder.events.count("start") == 2
+    assert recorder.events.count("end") == 1
+    assert recorder.events.count("error") == 1
+    assert len(recorder.events) == 4
+
+
+@pytest.mark.asyncio
+async def test_agenerate_cancellation_finalizes_all_running_items() -> None:
+    model = _CancellableChatModel(expected_slow_calls=3)
+    recorder = _CancellationRecordingHandler()
+
+    task = asyncio.create_task(
+        model.agenerate(
+            [
+                [HumanMessage(content="slow-1")],
+                [HumanMessage(content="slow-2")],
+                [HumanMessage(content="slow-3")],
+            ],
+            callbacks=[recorder],
+        )
+    )
+
+    try:
+        await asyncio.wait_for(model._all_slow_entered.wait(), 5)
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 5)
+    finally:
+        model._release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    assert recorder.events.count("start") == 3
+    assert recorder.events.count("error") == 3
+    assert recorder.events.count("end") == 0
+    assert len(recorder.events) == 6
+
+
+@pytest.mark.asyncio
+async def test_agenerate_cancellation_preserves_completed_batch_results() -> None:
+    model = _CancellableChatModel(expected_slow_calls=2)
+    recorder = _CancellationRecordingHandler()
+
+    task = asyncio.create_task(
+        model.agenerate(
+            [
+                [HumanMessage(content="fast")],
+                [HumanMessage(content="slow-1")],
+                [HumanMessage(content="slow-2")],
+            ],
+            callbacks=[recorder],
+        )
+    )
+
+    try:
+        await asyncio.wait_for(model._all_slow_entered.wait(), 5)
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 5)
+    finally:
+        model._release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    assert recorder.events.count("start") == 3
+    assert recorder.events.count("end") == 1
+    assert recorder.events.count("error") == 2
+    assert len(recorder.events) == 6
+
+
+@pytest.mark.asyncio
+async def test_agenerate_cancellation_without_callbacks() -> None:
+    model = _CancellableChatModel()
+
+    task = asyncio.create_task(model.agenerate([[HumanMessage(content="slow")]]))
+
+    try:
+        await asyncio.wait_for(model._entered.wait(), 5)
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 5)
+    finally:
+        model._release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_agenerate_repeated_cancellation_does_not_skip_callbacks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+
+    model = _CancellableChatModel(expected_slow_calls=3)
+    recorder = _CancellationRecordingHandler()
+
+    cleanup_started = asyncio.Event()
+    allow_cleanup = asyncio.Event()
+    original_gather = asyncio.gather
+    gather_calls = 0
+
+    async def controlled_gather(*aws: Any, **kwargs: Any) -> Any:
+        nonlocal gather_calls
+        gather_calls += 1
+
+        if gather_calls == 2:
+            cleanup_started.set()
+            await allow_cleanup.wait()
+
+        return await original_gather(*aws, **kwargs)
+
+    # Replace asyncio only in the module under test. This avoids
+    # changing asyncio.gather globally for the test runner.
+    monkeypatch.setattr(
+        chat_models,
+        "asyncio",
+        SimpleNamespace(
+            create_task=asyncio.create_task,
+            gather=controlled_gather,
+            shield=asyncio.shield,
+            CancelledError=asyncio.CancelledError,
+        ),
+    )
+    task = asyncio.create_task(
+        model.agenerate(
+            [
+                [HumanMessage(content="slow-1")],
+                [HumanMessage(content="slow-2")],
+                [HumanMessage(content="slow-3")],
+            ],
+            callbacks=[recorder],
+        )
+    )
+
+    try:
+        await asyncio.wait_for(model._all_slow_entered.wait(), 5)
+
+        # First cancellation starts the production cleanup path.
+        task.cancel()
+        await asyncio.wait_for(cleanup_started.wait(), 5)
+
+        # Cancel again while cleanup is deliberately paused.
+        task.cancel()
+        allow_cleanup.set()
+
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 5)
+    finally:
+        allow_cleanup.set()
+        model._release.set()
+
+        if not task.done():
+            task.cancel()
+
+        await asyncio.gather(task, return_exceptions=True)
+
+    assert recorder.events.count("start") == 3
+    assert recorder.events.count("error") == 3
+    assert recorder.events.count("end") == 0
+    assert len(recorder.events) == 6
 
 
 def test_output_version_stream(monkeypatch: Any) -> None:
